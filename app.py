@@ -6,7 +6,7 @@ from tkinter import ttk, messagebox
 
 import fitz
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import zxingcpp
 
 
@@ -29,6 +29,33 @@ def render_pdf_page(page, dpi=300):
     return Image.fromarray(arr)
 
 
+def barcode_points(result):
+    """Haal de vier hoekpunten uit een zxing-cpp resultaat."""
+    try:
+        pos = result.position
+        points = []
+
+        for name in ("top_left", "top_right", "bottom_right", "bottom_left"):
+            point = getattr(pos, name, None)
+            if point is None:
+                return None
+
+            x = getattr(point, "x", None)
+            y = getattr(point, "y", None)
+
+            if x is None or y is None:
+                try:
+                    x, y = point
+                except Exception:
+                    return None
+
+            points.append((int(x), int(y)))
+
+        return points
+    except Exception:
+        return None
+
+
 def extract_barcode_from_pdf(pdf_path, preview_callback=None, log_callback=None):
     doc = fitz.open(pdf_path)
 
@@ -38,7 +65,7 @@ def extract_barcode_from_pdf(pdf_path, preview_callback=None, log_callback=None)
             image = render_pdf_page(page)
 
             if preview_callback:
-                preview_callback(image, page_number + 1)
+                preview_callback(image, page_number + 1, None)
 
             if log_callback:
                 log_callback(f"Pagina {page_number + 1}/{len(doc)} scannen...")
@@ -50,8 +77,14 @@ def extract_barcode_from_pdf(pdf_path, preview_callback=None, log_callback=None)
                 fmt = str(result.format)
 
                 if value:
+                    points = barcode_points(result)
+
+                    if preview_callback:
+                        preview_callback(image, page_number + 1, points)
+
                     if log_callback:
                         log_callback(f"Barcode gevonden: {value} ({fmt})")
+
                     return value, page_number + 1, fmt
 
         return None, None, None
@@ -63,8 +96,8 @@ class BarcodeExtractorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Barcode Extractor")
-        self.root.geometry("820x620")
-        self.root.minsize(760, 560)
+        self.root.geometry("860x640")
+        self.root.minsize(780, 580)
 
         self.running = False
 
@@ -98,14 +131,28 @@ class BarcodeExtractorApp:
         self.scan_button = ttk.Button(controls, text="Scan input map", command=self.start_scan)
         self.scan_button.pack(side="left")
 
-        ttk.Button(controls, text="Open input", command=lambda: self.open_folder(INPUT_DIR)).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="Open output", command=lambda: self.open_folder(OUTPUT_DIR)).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Open input", command=lambda: self.open_folder(INPUT_DIR)).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(controls, text="Open output", command=lambda: self.open_folder(OUTPUT_DIR)).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.highlight_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls,
+            text="Markeer barcode",
+            variable=self.highlight_var,
+            command=self.refresh_current_preview,
+        ).pack(side="left", padx=(18, 0))
 
         self.progress = ttk.Progressbar(container, mode="determinate")
         self.progress.pack(fill="x", pady=(0, 10))
 
         self.status_var = tk.StringVar(value="Klaar")
-        ttk.Label(container, textvariable=self.status_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(container, textvariable=self.status_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(0, 10)
+        )
 
         body = ttk.Panedwindow(container, orient="horizontal")
         body.pack(fill="both", expand=True)
@@ -115,11 +162,24 @@ class BarcodeExtractorApp:
         body.add(preview_frame, weight=1)
         body.add(log_frame, weight=1)
 
-        self.preview_label = ttk.Label(preview_frame, text="Nog geen pagina geladen", anchor="center")
+        self.preview_label = ttk.Label(
+            preview_frame,
+            text="Nog geen pagina geladen",
+            anchor="center",
+        )
         self.preview_label.pack(fill="both", expand=True)
         self.preview_photo = None
+        self.current_preview_image = None
+        self.current_preview_page = None
+        self.current_barcode_points = None
 
-        self.log_text = tk.Text(log_frame, wrap="word", height=20, state="disabled", font=("Consolas", 9))
+        self.log_text = tk.Text(
+            log_frame,
+            wrap="word",
+            height=20,
+            state="disabled",
+            font=("Consolas", 9),
+        )
         self.log_text.pack(fill="both", expand=True)
 
     def open_folder(self, path):
@@ -138,12 +198,59 @@ class BarcodeExtractorApp:
     def set_status(self, text):
         self.root.after(0, lambda: self.status_var.set(text))
 
-    def update_preview(self, image, page_number):
+    def refresh_current_preview(self):
+        if self.current_preview_image is not None:
+            self.draw_preview(
+                self.current_preview_image,
+                self.current_preview_page,
+                self.current_barcode_points,
+            )
+
+    def draw_preview(self, image, page_number, points=None):
+        preview = image.copy()
+
+        if points and self.highlight_var.get():
+            draw = ImageDraw.Draw(preview)
+
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+
+            pad = max(12, int(min(preview.size) * 0.012))
+            left = max(0, min(xs) - pad)
+            top = max(0, min(ys) - pad)
+            right = min(preview.width - 1, max(xs) + pad)
+            bottom = min(preview.height - 1, max(ys) + pad)
+
+            line_width = max(8, int(min(preview.size) * 0.006))
+
+            # Felle groene rand rondom de gevonden barcode.
+            draw.rectangle(
+                (left, top, right, bottom),
+                outline="#39FF14",
+                width=line_width,
+            )
+
+        preview.thumbnail((390, 390))
+        self.preview_photo = ImageTk.PhotoImage(preview)
+
+        label = f"Pagina {page_number}"
+        if points:
+            label += "  •  barcode gevonden"
+
+        self.preview_label.configure(
+            image=self.preview_photo,
+            text=label,
+            compound="top",
+        )
+
+    def update_preview(self, image, page_number, points=None):
+        image_copy = image.copy()
+
         def update():
-            preview = image.copy()
-            preview.thumbnail((360, 360))
-            self.preview_photo = ImageTk.PhotoImage(preview)
-            self.preview_label.configure(image=self.preview_photo, text=f"Pagina {page_number}", compound="top")
+            self.current_preview_image = image_copy
+            self.current_preview_page = page_number
+            self.current_barcode_points = points
+            self.draw_preview(image_copy, page_number, points)
 
         self.root.after(0, update)
 
@@ -154,7 +261,10 @@ class BarcodeExtractorApp:
         pdf_files = sorted(INPUT_DIR.glob("*.pdf"))
 
         if not pdf_files:
-            messagebox.showinfo("Barcode Extractor", f"Geen PDF-bestanden gevonden in:\n{INPUT_DIR}")
+            messagebox.showinfo(
+                "Barcode Extractor",
+                f"Geen PDF-bestanden gevonden in:\n{INPUT_DIR}",
+            )
             return
 
         self.running = True
@@ -181,7 +291,10 @@ class BarcodeExtractorApp:
                     )
 
                     if barcode:
-                        safe_barcode = "".join(c for c in barcode if c.isalnum() or c in ("-", "_"))
+                        safe_barcode = "".join(
+                            c for c in barcode if c.isalnum() or c in ("-", "_")
+                        )
+
                         if not safe_barcode:
                             self.log("Barcode bevat geen bruikbare tekens.")
                             continue
@@ -199,15 +312,23 @@ class BarcodeExtractorApp:
                 except Exception as exc:
                     self.log(f"FOUT: {exc}")
 
-                self.root.after(0, lambda v=index: self.progress.configure(value=v))
+                self.root.after(
+                    0,
+                    lambda v=index: self.progress.configure(value=v),
+                )
 
-            self.set_status(f"Klaar. {found_count}/{len(pdf_files)} bestand(en) verwerkt.")
+            self.set_status(
+                f"Klaar. {found_count}/{len(pdf_files)} bestand(en) verwerkt."
+            )
             self.log("")
             self.log(f"KLAAR: {found_count} barcode(s) gevonden.")
 
         finally:
             self.running = False
-            self.root.after(0, lambda: self.scan_button.configure(state="normal"))
+            self.root.after(
+                0,
+                lambda: self.scan_button.configure(state="normal"),
+            )
 
 
 if __name__ == "__main__":
